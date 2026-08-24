@@ -61,6 +61,7 @@ class LiteLLMCompletionTransformationHandler:
         completion_args.update(kwargs)
         completion_args.update(litellm_completion_request)
         completion_args["_skip_responses_api_bridge"] = True
+        LiteLLMCompletionResponsesConfig.rebase_cache_control_injection_points(completion_args, input)
 
         litellm_completion_response: Final[ModelResponse | litellm.CustomStreamWrapper] = litellm.completion(
             **completion_args,
@@ -106,6 +107,7 @@ class LiteLLMCompletionTransformationHandler:
         acompletion_args.update(kwargs)
         acompletion_args.update(litellm_completion_request)
         acompletion_args["_skip_responses_api_bridge"] = True
+        LiteLLMCompletionResponsesConfig.rebase_cache_control_injection_points(acompletion_args, request_input)
 
         litellm_completion_response: Final[ModelResponse | litellm.CustomStreamWrapper] = await litellm.acompletion(
             **acompletion_args,

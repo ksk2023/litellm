@@ -387,6 +387,66 @@ class LiteLLMCompletionResponsesConfig:
         return messages
 
     @staticmethod
+    def rebase_cache_control_injection_points(
+        completion_args: dict[str, Any],  # mutable-ok: the rebased points are written back into the outgoing call args
+        request_input: str | ResponseInputParam,
+    ) -> None:
+        """Move positional cache-control injection points onto the messages this request sends.
+
+        An ``index`` counts items of the Responses ``input`` the caller sent. By the time
+        the bridge is done, that list has grown a leading system message built from
+        ``instructions`` and, when ``previous_response_id`` replays a session, that
+        session's messages too, so the same ordinal addresses a different message than the
+        caller meant. Role-located points survive the transform unchanged because the
+        transform preserves roles; positional ones have to move with their target.
+
+        Negative indices already count from the end, where the caller's input still sits,
+        so they are left alone.
+        """
+        points: Final = completion_args.get("cache_control_injection_points")
+        if not isinstance(points, list):
+            return
+        messages: Final = completion_args.get("messages")
+        if not isinstance(messages, list):
+            return
+        offset: Final = len(messages) - len(
+            LiteLLMCompletionResponsesConfig._transform_response_input_param_to_chat_completion_message(request_input)
+        )
+        if offset <= 0:
+            return
+        completion_args["cache_control_injection_points"] = [
+            LiteLLMCompletionResponsesConfig._shift_injection_point(point, offset) for point in points
+        ]
+
+    @staticmethod
+    def _positional_index(point: Mapping[str, object]) -> int | None:
+        """The point's ``index`` as an int, or None when it does not address a message positionally.
+
+        The documented shape allows the ordinal as a numeric string as well as an int.
+        """
+        raw: Final = point.get("index")
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _shift_injection_point(point: object, offset: int) -> object:
+        """One point rebased by ``offset``; anything without a non-negative index is returned as-is."""
+        if not isinstance(point, dict):
+            return point
+        index: Final = LiteLLMCompletionResponsesConfig._positional_index(point)
+        if index is None or index < 0:
+            return point
+        return {**point, "index": index + offset}
+
+    @staticmethod
     async def async_responses_api_session_handler(
         previous_response_id: str,
         litellm_completion_request: dict,

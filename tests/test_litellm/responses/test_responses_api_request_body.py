@@ -427,6 +427,15 @@ async def test_aresponses_websocket_strips_responses_routing_prefix_from_openai_
 
 _INJECTION_POINT_INPUT = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "hi"}]
 _SYSTEM_INJECTION_POINT = [{"location": "message", "role": "system"}]
+_ANTHROPIC_MESSAGES_PAYLOAD = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-5",
+    "content": [{"type": "text", "text": "Done."}],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 10, "output_tokens": 5},
+}
 
 
 def _sent_body(mock_post) -> dict:
@@ -598,3 +607,190 @@ def test_responses_custom_api_base_sends_no_openai_markers():
         body = _sent_body(mock_post)
         assert body["input"] == _INJECTION_POINT_INPUT
         assert "prompt_cache_options" not in body
+
+
+def test_bridged_requests_withhold_the_points_from_the_responses_layer_hook():
+    """The hook spends whatever configuration it is shown, so a bridged request must show
+    it none: the bridge holds the message list that actually goes upstream."""
+    from litellm.responses.main import _cache_control_points_applied_by_one_layer_only
+
+    kwargs = {"cache_control_injection_points": copy.deepcopy(_SYSTEM_INJECTION_POINT), "model": "x"}
+
+    with _cache_control_points_applied_by_one_layer_only(kwargs, bridged=True):
+        assert "cache_control_injection_points" not in kwargs
+
+    assert kwargs["cache_control_injection_points"] == _SYSTEM_INJECTION_POINT
+    assert kwargs["model"] == "x"
+
+
+def test_native_requests_let_the_responses_layer_hook_spend_the_points():
+    """Providers that serve Responses natively never reach the bridge, so this layer is
+    their only chance and must still see the configuration."""
+    from litellm.responses.main import _cache_control_points_applied_by_one_layer_only
+
+    kwargs = {"cache_control_injection_points": copy.deepcopy(_SYSTEM_INJECTION_POINT), "model": "x"}
+
+    with _cache_control_points_applied_by_one_layer_only(kwargs, bridged=False):
+        assert kwargs["cache_control_injection_points"] == _SYSTEM_INJECTION_POINT
+        kwargs.pop("cache_control_injection_points")
+
+    assert "cache_control_injection_points" not in kwargs
+
+
+def test_injection_points_are_not_invented_when_none_were_configured():
+    """Restoring must not resurrect a key the caller never sent."""
+    from litellm.responses.main import _cache_control_points_applied_by_one_layer_only
+
+    kwargs: dict = {"model": "x"}
+
+    with _cache_control_points_applied_by_one_layer_only(kwargs, bridged=True):
+        assert "cache_control_injection_points" not in kwargs
+
+    assert "cache_control_injection_points" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_injection_points_still_reach_a_native_responses_provider():
+    """Providers that serve Responses natively never reach the chat-completions bridge,
+    so this layer is their only chance to inject and must keep doing so."""
+    injected_client = AsyncHTTPHandler()
+    mock_post = AsyncMock(return_value=MockResponse(_minimal_responses_api_payload("resp_native", "gpt-5.6"), 200))
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="openai/gpt-5.6",
+        api_key="fake-api-key",
+        input=copy.deepcopy(_INJECTION_POINT_INPUT),
+        cache_control_injection_points=copy.deepcopy(_SYSTEM_INJECTION_POINT),
+        client=injected_client,
+    )
+
+    body = _sent_body(mock_post)
+    assert body["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "cache_control_injection_points" not in body
+
+
+_LIST_CONTENT_INPUT = [{"role": "user", "content": [{"type": "input_text", "text": "hi there friend"}]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "points",
+    [
+        pytest.param([{"location": "message", "role": "system"}], id="system-only"),
+        pytest.param(
+            [{"location": "message", "role": "user"}, {"location": "message", "role": "system"}],
+            id="mixed-user-and-system",
+        ),
+    ],
+)
+async def test_instructions_are_marked_when_the_bridge_builds_the_system_message(points):
+    """The system prompt in `instructions` must be marked whether or not a second point
+    already matches an input message; a matching point must not consume the rest."""
+    injected_client = AsyncHTTPHandler()
+    mock_post = AsyncMock(return_value=MockResponse(_ANTHROPIC_MESSAGES_PAYLOAD, 200))
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="anthropic/claude-sonnet-4-5",
+        api_key="fake-api-key",
+        instructions="You are a documentation assistant.",
+        input=[{"role": "user", "content": "hi"}],
+        cache_control_injection_points=copy.deepcopy(points),
+        client=injected_client,
+    )
+
+    body = _sent_body(mock_post)
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("hi", id="string-content"),
+        pytest.param([{"type": "input_text", "text": "hi there friend"}], id="list-content"),
+    ],
+)
+async def test_a_matching_point_does_not_stand_the_configuration_down(content):
+    """Only one layer may spend the configuration.
+
+    When the Responses layer also injected, its marks survived input shaping for list
+    content, and the completion layer read litellm's own marks as client breakpoints and
+    stood every configured point down -- so the instructions prefix went unmarked exactly
+    when a second point happened to match an input message.
+    """
+    injected_client = AsyncHTTPHandler()
+    mock_post = AsyncMock(return_value=MockResponse(_ANTHROPIC_MESSAGES_PAYLOAD, 200))
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="anthropic/claude-sonnet-4-5",
+        api_key="fake-api-key",
+        instructions="You are a documentation assistant.",
+        input=[{"role": "user", "content": copy.deepcopy(content)}],
+        cache_control_injection_points=[
+            {"location": "message", "role": "user"},
+            {"location": "message", "role": "system"},
+        ],
+        client=injected_client,
+    )
+
+    body = _sent_body(mock_post)
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instructions", [None, "You are a documentation assistant."])
+async def test_positional_points_address_the_input_item_the_caller_indexed(instructions):
+    """`index` counts the caller's `input` items.
+
+    The bridge prepends the system message it builds from `instructions`, so an unrebased
+    ordinal would silently slide onto that system message instead of the item the caller
+    meant. The same index must select the same content whether or not `instructions` is set.
+    """
+    injected_client = AsyncHTTPHandler()
+    mock_post = AsyncMock(return_value=MockResponse(_ANTHROPIC_MESSAGES_PAYLOAD, 200))
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="anthropic/claude-sonnet-4-5",
+        api_key="fake-api-key",
+        input=copy.deepcopy(_LIST_CONTENT_INPUT),
+        cache_control_injection_points=[{"location": "message", "index": 0}],
+        client=injected_client,
+        **({"instructions": instructions} if instructions else {}),
+    )
+
+    body = _sent_body(mock_post)
+    assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    if instructions:
+        assert "cache_control" not in json.dumps(body["system"])
+
+
+def test_negative_positional_points_are_left_alone():
+    """Negative indices already count from the end, where the caller's input still sits."""
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    args = {
+        "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+        "cache_control_injection_points": [
+            {"location": "message", "index": -1},
+            {"location": "message", "index": 0},
+            {"location": "message", "index": "0"},
+            {"location": "message", "role": "system"},
+        ],
+    }
+    LiteLLMCompletionResponsesConfig.rebase_cache_control_injection_points(
+        args, [{"role": "user", "content": "hi"}]
+    )
+
+    assert args["cache_control_injection_points"] == [
+        {"location": "message", "index": -1},
+        {"location": "message", "index": 1},
+        {"location": "message", "index": 1},
+        {"location": "message", "role": "system"},
+    ]

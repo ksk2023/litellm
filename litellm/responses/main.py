@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
-from collections.abc import Coroutine, Iterable, Mapping
+from collections.abc import Coroutine, Generator, Iterable, Mapping
+from contextlib import contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 
@@ -390,6 +391,69 @@ async def aresponses_api_with_mcp(
     return response
 
 
+_CACHE_CONTROL_INJECTION_POINTS: Final = "cache_control_injection_points"
+
+
+def _will_bridge_to_chat_completions(
+    model: str,
+    custom_llm_provider: str | None,
+    use_chat_completions_api: bool,
+) -> bool:
+    """Whether this request reaches its provider as a chat completion, not as a Responses call.
+
+    Mirrors the dispatch condition in ``responses()``: an explicit
+    ``use_chat_completions_api``, an unresolved provider, or a provider with no native
+    Responses config all end up at the completion transformation handler.
+    """
+    if use_chat_completions_api or custom_llm_provider is None:
+        return True
+    return ProviderConfigManager.get_provider_responses_api_config(model=model, provider=custom_llm_provider) is None
+
+
+def _responses_call_is_bridged(model: str, custom_llm_provider: str | None, kwargs: Mapping[str, object]) -> bool:
+    """``_will_bridge_to_chat_completions`` for callers that run before ``responses()`` normalises its arguments."""
+    normalized_model, from_prefix = _normalize_openai_chat_completions_responses_model(model)
+    return _will_bridge_to_chat_completions(
+        model=normalized_model,
+        custom_llm_provider=custom_llm_provider,
+        use_chat_completions_api=bool(kwargs.get("use_chat_completions_api")) or from_prefix,
+    )
+
+
+@contextmanager
+def _cache_control_points_applied_by_one_layer_only(
+    kwargs: dict[str, Any],  # mutable-ok: withholding the key from the hook means taking it out of the caller's kwargs
+    bridged: bool,
+) -> Generator[None, None]:
+    """Keep cache-control injection points out of the Responses-layer prompt-management hook when the bridge will run.
+
+    The hook pops ``cache_control_injection_points`` and applies what it can, so whichever
+    layer sees the configuration first is the layer that spends it. That has to be the
+    layer holding the message list actually sent upstream, because the two layers do not
+    see the same request: a Responses request keeps its system prompt in ``instructions``,
+    which only becomes a message when the chat-completion bridge builds one, and that
+    message also shifts every positional index by one.
+
+    Letting both layers act on the same configuration is what produced the two failure
+    modes here. Points spent at the Responses layer are dropped during input shaping for
+    string content, so the request reached the provider unmarked; when the content is a
+    list the marks survive instead, and the completion layer reads litellm's own marks as
+    client breakpoints and stands the whole configuration down -- including the system
+    point the instructions prefix needed.
+
+    So exactly one layer applies them. Bridged requests withhold here and let the bridge
+    resolve every point against the list it sends. Providers that serve Responses natively
+    never reach the bridge, so this layer is their only chance and it keeps injecting
+    exactly as before.
+    """
+    configured: Final = kwargs.pop(_CACHE_CONTROL_INJECTION_POINTS, None) if bridged else None
+    try:
+        yield
+    finally:
+        if configured is not None:
+            kwargs[_CACHE_CONTROL_INJECTION_POINTS] = configured
+
+
 @client
 async def aresponses(
     input: str | ResponseInputParam,
@@ -467,19 +531,22 @@ async def aresponses(
                 client_input: list[AllMessageValues] = [{"role": "user", "content": input}]
             else:
                 client_input = [item for item in input if isinstance(item, dict) and "role" in item]
-            (
-                model,
-                merged_input,
-                merged_optional_params,
-            ) = await litellm_logging_obj.async_get_chat_completion_prompt(
-                model=model,
-                messages=client_input,
-                non_default_params=kwargs,
-                prompt_id=prompt_id,
-                prompt_variables=prompt_variables,
-                prompt_label=kwargs.get("prompt_label", None),
-                prompt_version=kwargs.get("prompt_version", None),
-            )
+            with _cache_control_points_applied_by_one_layer_only(
+                kwargs, bridged=_responses_call_is_bridged(model, custom_llm_provider, kwargs)
+            ):
+                (
+                    model,
+                    merged_input,
+                    merged_optional_params,
+                ) = await litellm_logging_obj.async_get_chat_completion_prompt(
+                    model=model,
+                    messages=client_input,
+                    non_default_params=kwargs,
+                    prompt_id=prompt_id,
+                    prompt_variables=prompt_variables,
+                    prompt_label=kwargs.get("prompt_label", None),
+                    prompt_version=kwargs.get("prompt_version", None),
+                )
             input = cast(
                 str | ResponseInputParam,
                 ResponsesAPIRequestUtils.merge_prompt_management_input(
@@ -566,6 +633,7 @@ def _apply_prompt_management_to_responses_call(
     litellm_logging_obj: LiteLLMLoggingObj | None,
     kwargs: dict[str, Any],
     local_vars: dict[str, object],
+    use_chat_completions_api: bool,
 ) -> tuple[str | ResponseInputParam, str, str | None]:
     async_merged: Final[Mapping[str, object] | None] = kwargs.pop("_async_prompt_merged_params", None)
     if async_merged is not None:
@@ -585,19 +653,23 @@ def _apply_prompt_management_to_responses_call(
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and litellm_logging_obj.should_run_prompt_management_hooks(
         prompt_id=prompt_id, non_default_params=kwargs
     ):
-        (
-            model,
-            merged_input,
-            merged_optional_params,
-        ) = litellm_logging_obj.get_chat_completion_prompt(
-            model=model,
-            messages=client_input,
-            non_default_params=kwargs,
-            prompt_id=prompt_id,
-            prompt_variables=prompt_variables,
-            prompt_label=kwargs.get("prompt_label", None),
-            prompt_version=kwargs.get("prompt_version", None),
-        )
+        with _cache_control_points_applied_by_one_layer_only(
+            kwargs,
+            bridged=_will_bridge_to_chat_completions(model, custom_llm_provider, use_chat_completions_api),
+        ):
+            (
+                model,
+                merged_input,
+                merged_optional_params,
+            ) = litellm_logging_obj.get_chat_completion_prompt(
+                model=model,
+                messages=client_input,
+                non_default_params=kwargs,
+                prompt_id=prompt_id,
+                prompt_variables=prompt_variables,
+                prompt_label=kwargs.get("prompt_label", None),
+                prompt_version=kwargs.get("prompt_version", None),
+            )
         input = cast(
             str | ResponseInputParam,
             ResponsesAPIRequestUtils.merge_prompt_management_input(
@@ -961,6 +1033,7 @@ def responses(
             litellm_logging_obj=litellm_logging_obj,
             kwargs=kwargs,
             local_vars=local_vars,
+            use_chat_completions_api=use_chat_completions_api,
         )
 
         #########################################################
